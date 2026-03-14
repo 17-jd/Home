@@ -6,6 +6,7 @@ struct ScanResult: Identifiable {
     let id = UUID()
     let ip: String
     var hostname: String?
+    var pingMs: Int?
     let respondedAt: Date
 }
 
@@ -21,6 +22,9 @@ class NetworkScanner {
     /// Updated by both full scan() and quickPresenceCheck().
     var respondingIPs: Set<String> = []
 
+    /// Latest round-trip time (ms) per IP. Updated by scan and presence checks.
+    var pingTimes: [String: Int] = [:]
+
     // MARK: - Full network scan
 
     func scan(subnet: String) async {
@@ -28,76 +32,61 @@ class NetworkScanner {
         progress   = 0
         results    = []
 
-        let ips   = (1...254).map { "\(subnet).\($0)" }
-        let total = Double(ips.count)
-        var done  = 0.0
+        let ips = (1...254).map { "\(subnet).\($0)" }
 
-        // Bonjour runs the full ~4 s in parallel — used for hostnames only.
+        // Bonjour runs for the full scan duration in the background.
         async let mdnsFuture: [ScanResult] = NetworkScanner.mdnsScan()
 
-        // ── Phase 1: UDP sweep ────────────────────────────────────────────────
-        // Sending one UDP byte to every IP triggers an ARP request at the
-        // network layer, so online devices appear in the ARP cache.
-        // Without this, probing unknown IPs via ICMP would stall ~3 s each
-        // waiting for ARP to time out.
-        await withTaskGroup(of: Void.self) { group in
-            for ip in ips { group.addTask { await NetworkScanner.udpPoke(ip) } }
-            for await _ in group {
-                done += 1
-                progress = (done / total) * 0.40
-            }
-        }
+        // ── Pass 1: wake devices + first ARP read ─────────────────────────────
+        // UDP pokes trigger ARP at Layer 2. We wait 1500 ms for devices to wake
+        // and respond, then ICMP-verify the candidates.
+        await udpSweep(ips: ips, progressStart: 0.00, progressEnd: 0.22)
+        try? await Task.sleep(for: .milliseconds(1500))
+        progress = 0.28
+        let arp1    = Set(NetworkScanner.readARPCache(subnet: subnet))
+        let timed1  = await NetworkScanner.icmpVerifyWithRetry(ips: arp1)
+        progress = 0.50
 
-        // ── Phase 2: Wait for ARP cache to populate ───────────────────────────
-        try? await Task.sleep(for: .milliseconds(800))
-        progress = 0.48
+        // ── Pass 2: catch late-waking devices ────────────────────────────────
+        // Some devices (phones in deep sleep, certain IoT) take >1500 ms to
+        // respond to the first ARP. A second sweep + wait catches them.
+        // Only IPs that didn't respond in pass 1 are re-verified (fast).
+        await udpSweep(ips: ips, progressStart: 0.50, progressEnd: 0.65)
+        try? await Task.sleep(for: .milliseconds(1500))
+        progress = 0.70
+        let arp2    = Set(NetworkScanner.readARPCache(subnet: subnet))
+        let newIPs  = arp2.subtracting(Set(timed1.keys))
+        let timed2  = newIPs.isEmpty ? [:] as [String: Int]
+                                     : await NetworkScanner.icmpVerifyWithRetry(ips: newIPs)
+        progress = 0.85
 
-        // ── Phase 3: Read ARP cache → candidate IPs ──────────────────────────
-        // This gives us ~10-20 candidates (devices that responded to ARP).
-        // Stale COMPLETE entries (offline devices within the 20-min window)
-        // will also appear here — Phase 4 ICMP filters them out.
-        let arpIPs = Set(NetworkScanner.readARPCache(subnet: subnet))
-        progress = 0.52
+        // Merge both passes
+        var allTimed = timed1
+        for (ip, ms) in timed2 { allTimed[ip] = ms }
 
-        // ── Phase 4: ICMP verify ──────────────────────────────────────────────
-        // Ping each ARP candidate. ICMP echo is authoritative:
-        //   • Online device  → echo reply received → keep ✓
-        //   • Offline device → no reply (stale ARP entry) → drop ✓
-        // Runs concurrently with the remaining ~2.8 s of Bonjour, so it
-        // adds zero extra time to the total scan duration.
-        async let icmpFuture: Set<String> = NetworkScanner.icmpVerify(ips: arpIPs)
+        for (ip, ms) in allTimed { insertSorted(ScanResult(ip: ip, pingMs: ms, respondedAt: Date())) }
+        pingTimes.merge(allTimed) { _, new in new }
 
-        let icmpVerified = await icmpFuture
-        progress = 0.75
-
-        // Build results from ICMP-verified IPs
-        for ip in icmpVerified { insertSorted(ScanResult(ip: ip, respondedAt: Date())) }
-
-        // ── Phase 5: ARP-only fallback ────────────────────────────────────────
-        // If ICMP returned nothing (e.g. socket() fails on this iOS build),
-        // fall back to the ARP results unfiltered. Better than nothing.
+        // ARP-only fallback (ICMP socket unavailable)
         if results.isEmpty {
-            for ip in arpIPs { insertSorted(ScanResult(ip: ip, respondedAt: Date())) }
+            for ip in arp1.union(arp2) { insertSorted(ScanResult(ip: ip, respondedAt: Date())) }
         }
 
-        // ── Phase 6: TCP fallback ─────────────────────────────────────────────
-        // Last resort — used when both ICMP and ARP return nothing.
+        // TCP last resort
         if results.isEmpty {
             await withTaskGroup(of: ScanResult?.self) { group in
                 for ip in ips { group.addTask { await NetworkScanner.tcpProbe(ip: ip) } }
-                for await result in group {
-                    if let result { insertSorted(result) }
-                }
+                for await r in group { if let r { insertSorted(r) } }
             }
         }
 
-        // ── Phase 7: Bonjour enrichment ───────────────────────────────────────
+        // Bonjour enrichment — collect whatever mDNS found during the scan
         let mdns = await mdnsFuture
-        for result in mdns {
-            if let idx = results.firstIndex(where: { $0.ip == result.ip }) {
-                results[idx].hostname = result.hostname
+        for r in mdns {
+            if let idx = results.firstIndex(where: { $0.ip == r.ip }) {
+                results[idx].hostname = r.hostname
             } else {
-                insertSorted(result)
+                insertSorted(r)
             }
         }
 
@@ -107,21 +96,66 @@ class NetworkScanner {
         progress      = 1.0
     }
 
+    private func udpSweep(ips: [String], progressStart: Double, progressEnd: Double) async {
+        let total = Double(ips.count)
+        var done  = 0.0
+        await withTaskGroup(of: Void.self) { group in
+            for ip in ips { group.addTask { await NetworkScanner.udpPoke(ip) } }
+            for await _ in group {
+                done    += 1
+                progress = progressStart + (done / total) * (progressEnd - progressStart)
+            }
+        }
+    }
+
     // MARK: - Background presence check
 
-    /// Probes only the IPs of assigned devices using ICMP.
-    /// Much faster than a full scan (~1.5 s for 6 devices vs ~4 s for 254).
+    /// Probes only the IPs of assigned devices.
+    ///
+    /// Strategy — designed to handle iPhones in deep sleep:
+    ///   Round 1 : ICMP only (catches already-awake devices in <100 ms)
+    ///   Round 2 : UDP wake → 1.5 s wait → ICMP  (wakes sleeping phones)
+    ///   Round 3 : ICMP again (last chance for slow wakers)
+    ///
+    /// Only devices that fail ALL three rounds are considered offline.
     func quickPresenceCheck(deviceIPs: [String], subnet: String) async {
         guard !isScanning, !isCheckingPresence, !deviceIPs.isEmpty else { return }
         isCheckingPresence = true
         defer { isCheckingPresence = false }
 
-        let verified = await NetworkScanner.icmpVerify(ips: Set(deviceIPs))
+        var toCheck   = Set(deviceIPs)
+        var confirmed = [String: Int]()
+
+        // Round 1 — direct ICMP, fast
+        let r1 = await NetworkScanner.icmpVerifyTimed(ips: toCheck)
+        for (ip, ms) in r1 { confirmed[ip] = ms }
+        toCheck = toCheck.subtracting(Set(r1.keys))
+
+        if !toCheck.isEmpty {
+            // Round 2 — UDP-wake the specific IPs first, then ICMP
+            // This is the key fix for sleeping iPhones: a UDP packet triggers
+            // the network stack to wake before we ICMP-probe.
+            await withTaskGroup(of: Void.self) { group in
+                for ip in toCheck { group.addTask { await NetworkScanner.udpPoke(ip) } }
+                for await _ in group {}
+            }
+            try? await Task.sleep(for: .milliseconds(1500))
+            let r2 = await NetworkScanner.icmpVerifyTimed(ips: toCheck)
+            for (ip, ms) in r2 { confirmed[ip] = ms }
+            toCheck = toCheck.subtracting(Set(r2.keys))
+        }
+
+        if !toCheck.isEmpty {
+            // Round 3 — final ICMP attempt
+            try? await Task.sleep(for: .seconds(1))
+            let r3 = await NetworkScanner.icmpVerifyTimed(ips: toCheck)
+            for (ip, ms) in r3 { confirmed[ip] = ms }
+        }
 
         var updated = respondingIPs
         for ip in deviceIPs {
-            if verified.contains(ip) { updated.insert(ip) }
-            else                     { updated.remove(ip)  }
+            if let ms = confirmed[ip] { updated.insert(ip); pingTimes[ip] = ms }
+            else                      { updated.remove(ip) }
         }
         respondingIPs = updated
     }
@@ -162,76 +196,77 @@ class NetworkScanner {
 
 extension NetworkScanner {
 
-    /// Verifies a set of IPs concurrently via ICMP echo.
-    /// Returns the subset that replied (i.e. are actually online).
-    nonisolated static func icmpVerify(ips: Set<String>) async -> Set<String> {
-        await withTaskGroup(of: String?.self) { group in
+    /// Full-scan verify: pings all IPs in parallel, retries once per device.
+    /// Returns IP → pingMs for all devices that replied.
+    nonisolated static func icmpVerifyWithRetry(ips: Set<String>) async -> [String: Int] {
+        await withTaskGroup(of: (String, Int)?.self) { group in
             for ip in ips {
-                group.addTask { await icmpPing(ip: ip) ? ip : nil }
+                group.addTask {
+                    if let ms = icmpPing(ip: ip, timeoutMS: 800) { return (ip, ms) }
+                    try? await Task.sleep(for: .milliseconds(200))
+                    guard let ms = icmpPing(ip: ip, timeoutMS: 800) else { return nil }
+                    return (ip, ms)
+                }
             }
-            var alive = Set<String>()
-            for await ip in group { if let ip { alive.insert(ip) } }
-            return alive
+            var result = [String: Int]()
+            for await entry in group { if let (ip, ms) = entry { result[ip] = ms } }
+            return result
         }
     }
 
-    /// Async wrapper: dispatches blocking socket call to a background thread
-    /// so it doesn't stall Swift's cooperative thread pool.
-    nonisolated private static func icmpPing(ip: String) async -> Bool {
-        await withCheckedContinuation { cont in
-            DispatchQueue.global(qos: .utility).async {
-                cont.resume(returning: icmpPingBlocking(ip: ip))
+    /// Single-round verify: one ping per device, all in parallel.
+    /// Returns IP → pingMs for responding devices. Used in presence check rounds.
+    nonisolated static func icmpVerifyTimed(ips: Set<String>) async -> [String: Int] {
+        await withTaskGroup(of: (String, Int)?.self) { group in
+            for ip in ips {
+                group.addTask {
+                    guard let ms = icmpPing(ip: ip, timeoutMS: 800) else { return nil }
+                    return (ip, ms)
+                }
             }
+            var result = [String: Int]()
+            for await entry in group { if let (ip, ms) = entry { result[ip] = ms } }
+            return result
         }
     }
 
-    /// Sends a real ICMP echo request and waits for a reply.
-    ///
-    /// Uses SOCK_DGRAM (not SOCK_RAW) so no entitlement is required on iOS.
-    /// The kernel handles the IP header; we only see ICMP header + data.
-    /// connect() filters recv() to replies from the target IP only, which
-    /// prevents interference between the 10-20 concurrent pings.
-    nonisolated private static func icmpPingBlocking(ip: String, timeoutMS: Int = 1500) -> Bool {
-        // SOCK_DGRAM + IPPROTO_ICMP = unprivileged ICMP (no root / no entitlement)
+    /// Blocking ICMP echo. Returns round-trip time in ms, or nil if no reply.
+    /// Uses SOCK_DGRAM (unprivileged on iOS — no entitlement needed).
+    /// connect() filters recv() to the target IP, preventing cross-talk between
+    /// the many concurrent pings.
+    nonisolated private static func icmpPing(ip: String, timeoutMS: Int = 1500) -> Int? {
         let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)
-        guard fd >= 0 else { return false }
+        guard fd >= 0 else { return nil }
         defer { Darwin.close(fd) }
 
-        // Receive timeout — if no reply within this window, device is offline
         var tv = timeval()
         tv.tv_sec  = timeoutMS / 1000
         tv.tv_usec = Int32((timeoutMS % 1000) * 1000)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 
-        // Destination
         var dest = sockaddr_in()
         dest.sin_len    = UInt8(MemoryLayout<sockaddr_in>.size)
         dest.sin_family = sa_family_t(AF_INET)
-        guard inet_pton(AF_INET, ip, &dest.sin_addr) == 1 else { return false }
+        guard inet_pton(AF_INET, ip, &dest.sin_addr) == 1 else { return nil }
 
-        // connect() so recv() only returns packets from this specific IP
         let connected = withUnsafePointer(to: &dest) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
             }
         }
-        guard connected else { return false }
+        guard connected else { return nil }
 
-        // Build ICMP echo request (type=8, code=0, identifier=1, seq=1)
         let packet = buildICMPPacket()
-        let sent = packet.withUnsafeBytes { buf in
-            Darwin.send(fd, buf.baseAddress!, buf.count, 0)
-        }
-        guard sent > 0 else { return false }
+        let t0     = DispatchTime.now()
+        let sent   = packet.withUnsafeBytes { buf in Darwin.send(fd, buf.baseAddress!, buf.count, 0) }
+        guard sent > 0 else { return nil }
 
-        // Any reply from the connected IP means the device is alive.
-        // (ICMP echo reply = type 0; could also be ICMP error, but either way
-        // the remote host exists and is reachable.)
-        var recvBuf = [UInt8](repeating: 0, count: 64)
-        let received = recvBuf.withUnsafeMutableBytes { ptr in
-            Darwin.recv(fd, ptr.baseAddress!, 64, 0)
-        }
-        return received > 0
+        var recvBuf  = [UInt8](repeating: 0, count: 64)
+        let received = recvBuf.withUnsafeMutableBytes { ptr in Darwin.recv(fd, ptr.baseAddress!, 64, 0) }
+        guard received > 0 else { return nil }
+
+        let ms = Int((DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1_000_000)
+        return max(1, ms)
     }
 
     /// Builds a minimal ICMP echo request packet with a valid checksum.
