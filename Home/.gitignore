@@ -33,3 +33,20 @@ Carthage/Build/
 
 # Env
 .env
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Other projects in parent folder
+../GreenTag/
+../HomePresence/
+../IOT Project/
+../LTspice/
+../1/
+../Zoom/
+../*.pdf
+../*.jpg
+../.env
+../.localized
+../.DS_Store
